@@ -1,6 +1,3 @@
-//#include <fstream>
-//#include <stdlib.h>
-//#include <string>
 #include <ctime>
 #include "radixSort.h"
 
@@ -11,23 +8,19 @@
 
 cudaError_t radixCuda(int* v, const unsigned int size);
 
-__global__ void addKernel(int *c, const int *a, const int *b)
-{
-    int i = THREAD_ID;
-    c[i] = a[i] + b[i];
-}
-
 __global__ void isEvenKernel(const int* v, uint* e, const int size, const int powOfTwo)
 {
 	int i = THREAD_ID;
-	e[i] = !((1 << powOfTwo) & v[i]);
+	if (i < size)
+		e[i] = !((1 << powOfTwo) & v[i]);
 
 }
 
-__global__ void exclusiveScanShiftCopy(uint* dst, const uint* src, const int size)
+__global__ void exclusiveScanShiftCopyKernel(uint* dst, const uint* src, const int size)
 {
 	int i = THREAD_ID;
-	dst[i] = (i > 0) ? src[i - 1] : 0;
+	if (i < size)
+		dst[i] = (i > 0) ? src[i - 1] : 0;
 }
 
 __global__ void scanKernel(uint* f, const int size, const int round)
@@ -44,40 +37,46 @@ __global__ void scanKernel(uint* f, const int size, const int round)
 	int i = THREAD_ID;
 	int prevValOffset = 1 << (round - 1);
 
-	f[writeOffset + i] = (i >= prevValOffset) ? f[readOffset + i] + f[readOffset + i - prevValOffset] : f[readOffset + i];
+	if (i < size)
+		f[writeOffset + i] = (i >= prevValOffset) 
+		? f[readOffset + i] + f[readOffset + i - prevValOffset] 
+		: f[readOffset + i];
 }
 
-__global__ void populateTrueMaskKernel(uint* t, const uint* f, const int totalF)
+__global__ void populateTrueMaskKernel(uint* t, const uint* f, const int totalF, const int size)
 {
 	const int i = THREAD_ID;
-	t[i] = i - f[i] + totalF;
+	if (i < size)
+		t[i] = i - f[i] + totalF;
 }
 
-__global__ void calculateDstKernel(uint* dst, const uint* e, const uint* f, const uint* t)
+__global__ void calculateDstKernel(uint* dst, const uint* e, const uint* f, const uint* t, const int size)
 {
 	const int i = THREAD_ID;
-	dst[i] = (!e[i]) ? t[i] : f[i];
+	if (i < size)
+		dst[i] = (!e[i]) ? t[i] : f[i];
 }
 
-__global__ void mapOutputKernel(int* o, const int* v, const uint* dst)
+__global__ void mapOutputKernel(int* o, const int* v, const uint* dst, const int size)
 {
 	const int i = THREAD_ID;
-	o[dst[i]] = v[i];
+	if (i < size)
+		o[dst[i]] = v[i];
 }
 
 
 int main()
 {
 	using namespace std;
-	const unsigned long minSize = 600;
-	const unsigned long maxSize = 1024;
+	const unsigned long minSize = 32768000;
+	const unsigned long maxSize = 32768000;
 
 	cout << "Beginning tests size " << minSize << " to " << maxSize << endl;
-	for (unsigned long vSize = minSize; vSize <= maxSize; ++vSize)
+	for (unsigned long vSize = minSize; vSize <= maxSize; vSize *= 2)
 	{
-		const unsigned long range = vSize * 200;
+		const unsigned long range = vSize * 5;
 
-		cout << vSize << endl;
+		//cout << vSize << endl;
 
 		/*
 		vector<uint32_t> v(vSize);
@@ -148,12 +147,18 @@ int main()
 		//printV(v, vSize, 16);
 		//cout << "================================================\n================================================" << endl;
 
+		clock_t t0 = clock();
 		cudaError_t status = radixCuda(v, vSize);
+		clock_t t1 = clock();
+
 		if (status != cudaSuccess) {
 			fprintf(stderr, "radixCuda failed!\n");
 			PressEnterToContinue();
 			return 1;
 		}
+
+		double dt = (double)(t1 - t0) / CLOCKS_PER_SEC;
+		double TpE = dt / vSize;
 
 		// cudaDeviceReset must be called before exiting in order for profiling and
 		// tracing tools such as Nsight and Visual Profiler to show complete traces.
@@ -173,6 +178,8 @@ int main()
 		//cout << "\nSort complete." << endl;
 		free(v);
 		free(vTest);
+		cout << TpE << endl;
+
 	}
 	cout << "Tests from list size " << minSize << " to " << maxSize << " completed.\n";
 
@@ -202,6 +209,11 @@ cudaError_t radixCuda(int* v, const unsigned int size)
 		if (logSizeTester == 1) ++logOfSize;
 	}
 
+	// TODO: generalize this
+	const uint threadsPerBlock = 1024;
+	// for multiple blocks
+	const uint numBlocks = size / threadsPerBlock + !!(size % threadsPerBlock);
+
 	// set GPU
 	status = cudaSetDevice(0);
 	if (status != cudaSuccess)
@@ -211,12 +223,13 @@ cudaError_t radixCuda(int* v, const unsigned int size)
 	}
 
 	// allocate GPU buffers
-	CUDA_MALLOC(dev_v, size * sizeof(int), status);
-	CUDA_MALLOC(dev_e, size * sizeof(uint), status);
-	CUDA_MALLOC(dev_f, size * sizeof(uint) * 2, status); // needs to be twice as long as input for hillis steele scan
-	CUDA_MALLOC(dev_t, size * sizeof(uint), status);
-	CUDA_MALLOC(dev_dst, size * sizeof(uint), status);
-	CUDA_MALLOC(dev_o, size * sizeof(int), status);
+	CUDA_MALLOC(dev_v,   size * sizeof(int),      status);
+	CUDA_MALLOC(dev_e,   size * sizeof(uint),     status);
+	CUDA_MALLOC(dev_f,   size * sizeof(uint) * 2, status); // needs to be twice as long as input for hillis steele scan
+	CUDA_MALLOC(dev_t,   size * sizeof(uint),     status);
+	CUDA_MALLOC(dev_dst, size * sizeof(uint),     status);
+	CUDA_MALLOC(dev_o,   size * sizeof(int),      status);
+
 	CUDA_MEMCPY(dev_v, v, size * sizeof(int), cudaMemcpyHostToDevice, status);
 
 	/*std::cout << "dev_v:   ";
@@ -234,20 +247,17 @@ cudaError_t radixCuda(int* v, const unsigned int size)
 
 		/*std::cout << "-----------------------------------------------------------------\n";
 		std::cout << "Round " << i << "\n";*/
-
-		isEvenKernel<<<1, size >>>(dev_v, dev_e, size, i);
+		isEvenKernel <<< numBlocks, threadsPerBlock >>> (dev_v, dev_e, size, i);
 		KERNEL_LAUNCH_ERROR(isEvenKernel, status);
 		SYNC_KERNEL(isEvenKernel, status);
-
 
 		/*std::cout << "dev_e:   ";
 		printOnCPU(dev_e, size, size);
 */
-
 		// Copy isEven buffer to scan buffer (shifting for prefix scan).
-		exclusiveScanShiftCopy<<<1, size>>>(dev_f, dev_e, size);
-		KERNEL_LAUNCH_ERROR(exclusiveScanShiftCopy, status);
-		SYNC_KERNEL(exclusiveScanShiftCopy, status);
+		exclusiveScanShiftCopyKernel<<< numBlocks, threadsPerBlock >>>(dev_f, dev_e, size);
+		KERNEL_LAUNCH_ERROR(exclusiveScanShiftCopyKernel, status);
+		SYNC_KERNEL(exclusiveScanShiftCopyKernel, status);
 
 	/*	std::cout << "dev_f_0: ";
 		printOnCPU(dev_f, size * 2, size * 2);*/
@@ -257,7 +267,7 @@ cudaError_t radixCuda(int* v, const unsigned int size)
 		// create prefix sum
 		for (int j = 1; j <= logOfSize; ++j)
 		{
-			scanKernel<<< 1, size >>>(dev_f, size, j);
+			scanKernel<<< numBlocks, threadsPerBlock >>>(dev_f, size, j);
 			KERNEL_LAUNCH_ERROR(scanKernel, status);
 			SYNC_KERNEL(scanKernel, status);
 
@@ -285,14 +295,14 @@ cudaError_t radixCuda(int* v, const unsigned int size)
 		const uint totalF = eLast + fLast;
 
 		// populate dev_t
-		populateTrueMaskKernel<<<1, size>>>(dev_t, dev_f, totalF);
+		populateTrueMaskKernel<<< numBlocks, threadsPerBlock >>>(dev_t, dev_f, totalF, size);
 		KERNEL_LAUNCH_ERROR(populateTrueMaskKernel, status);
 		SYNC_KERNEL(populateTrueMaskKernel, status);
 
 		/*std::cout << "dev_t:   ";
 		printOnCPU(dev_t, size, size);*/
 
-		calculateDstKernel<<<1, size>>> (dev_dst, dev_e, dev_f, dev_t);
+		calculateDstKernel<<< numBlocks, threadsPerBlock >>> (dev_dst, dev_e, dev_f, dev_t, size);
 		KERNEL_LAUNCH_ERROR(calculateDstKernel, status);
 		SYNC_KERNEL(calculateDstKernel, status);
 		
@@ -300,7 +310,7 @@ cudaError_t radixCuda(int* v, const unsigned int size)
 	/*	std::cout << "dev_dst: ";
 		printOnCPU(dev_dst, size, size);*/
 
-		mapOutputKernel<<<1, size>>>(dev_o, dev_v, dev_dst);
+		mapOutputKernel<<< numBlocks, threadsPerBlock >>>(dev_o, dev_v, dev_dst, size);
 		KERNEL_LAUNCH_ERROR(mapOutputKernel, status);
 		SYNC_KERNEL(mapOutputKernel, status);
 
